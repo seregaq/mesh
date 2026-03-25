@@ -6,7 +6,7 @@ from typing import Any
 import networkx as nx
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -39,6 +39,22 @@ class MeshNode:
     status: dict[str, Any]
 
 
+class ScanWorker(QObject):
+    finished = Signal(object, object)
+
+    def __init__(self, subnet: str, limit: int) -> None:
+        super().__init__()
+        self.subnet = subnet
+        self.limit = limit
+
+    def run(self) -> None:
+        try:
+            data = scan(subnet=self.subnet, limit=self.limit)
+            self.finished.emit(data, None)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            self.finished.emit([], str(exc))
+
+
 class MeshManagerWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -47,6 +63,9 @@ class MeshManagerWindow(QMainWindow):
 
         self.nodes: dict[str, MeshNode] = {}
         self.links: list[dict[str, str]] = []
+        self._scan_thread: QThread | None = None
+        self._scan_worker: ScanWorker | None = None
+        self._scan_in_progress = False
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -91,13 +110,13 @@ class MeshManagerWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setSizes([380, 820])
 
-        self.scan_btn.clicked.connect(self.perform_scan)
+        self.scan_btn.clicked.connect(self.start_scan)
         self.auto_refresh.stateChanged.connect(self._toggle_auto_refresh)
         self.node_list.currentItemChanged.connect(self._show_selected_node)
         self.reboot_btn.clicked.connect(self._reboot_selected_node)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.perform_scan)
+        self.timer.timeout.connect(self.start_scan)
 
     def _toggle_auto_refresh(self) -> None:
         if self.auto_refresh.isChecked():
@@ -114,12 +133,43 @@ class MeshManagerWindow(QMainWindow):
             self.limit_input.setText(str(limit))
         return subnet, limit
 
-    def perform_scan(self) -> None:
+    def start_scan(self) -> None:
+        if self._scan_in_progress:
+            return
+
         subnet, limit = self._get_scan_params()
-        data = scan(subnet=subnet, limit=limit)
+        self._scan_in_progress = True
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("Scanning...")
+
+        self._scan_thread = QThread(self)
+        self._scan_worker = ScanWorker(subnet=subnet, limit=limit)
+        self._scan_worker.moveToThread(self._scan_thread)
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_thread.finished.connect(self._cleanup_scan_worker)
+        self._scan_thread.start()
+
+    def _on_scan_finished(self, data: list[dict[str, Any]], error: str | None) -> None:
+        self._scan_in_progress = False
+        self.scan_btn.setEnabled(True)
+        self.scan_btn.setText("Scan")
+        if error:
+            QMessageBox.critical(self, "Scan failed", error)
+            return
+
         self.nodes = {node["ip"]: MeshNode(ip=node["ip"], status=node) for node in data if "ip" in node}
         self._refresh_node_list()
         self._refresh_topology()
+
+    def _cleanup_scan_worker(self) -> None:
+        if self._scan_worker:
+            self._scan_worker.deleteLater()
+            self._scan_worker = None
+        if self._scan_thread:
+            self._scan_thread.deleteLater()
+            self._scan_thread = None
 
     def _refresh_node_list(self) -> None:
         current_ip = self._selected_ip()
@@ -228,5 +278,5 @@ def run_app() -> None:
     app = QApplication.instance() or QApplication([])
     window = MeshManagerWindow()
     window.show()
-    window.perform_scan()
+    window.start_scan()
     app.exec()
