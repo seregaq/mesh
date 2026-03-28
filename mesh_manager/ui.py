@@ -172,15 +172,31 @@ class MeshManagerWindow(QMainWindow):
             self._scan_thread = None
 
     def _refresh_node_list(self) -> None:
+        """Обновляет список узлов в GUI"""
         current_ip = self._selected_ip()
         self.node_list.clear()
 
+        from PySide6.QtGui import QColor, QBrush
+        from PySide6.QtCore import Qt
+
         for ip, node in sorted(self.nodes.items()):
+            configured = node.status.get("configured", True)
             role = str(node.status.get("role", "client"))
-            item = QListWidgetItem(f"{ip} ({role})")
-            item.setData(1, ip)
+
+            if configured:
+                text = f"{ip}  ({role})"
+                item = QListWidgetItem(text)
+                item.setBackground(QBrush(QColor(255, 255, 255)))  # белый фон
+            else:
+                text = f"🔴 [NEW] {ip}  — запустите скрипт настройки"
+                item = QListWidgetItem(text)
+                # Красный фон для новых узлов
+                item.setBackground(QBrush(QColor(255, 220, 220)))   # светло-красный
+
+            item.setData(1, ip)        # храним IP в данных элемента
             self.node_list.addItem(item)
 
+        # Восстанавливаем предыдущий выбор
         if current_ip:
             for i in range(self.node_list.count()):
                 item = self.node_list.item(i)
@@ -203,38 +219,63 @@ class MeshManagerWindow(QMainWindow):
         self._draw_graph()
 
     def _draw_graph(self) -> None:
+        """Рисует граф топологии с хорошим размещением и масштабированием"""
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         graph = nx.Graph()
 
+        # Добавляем все найденные узлы
         for ip in self.nodes:
             graph.add_node(ip)
 
+        # Добавляем связи (links), если они есть
         for link in self.links:
             source = link.get("source")
             target = link.get("target")
             if source and target:
                 graph.add_edge(source, target)
 
+        # Цвета узлов по роли
         colors = []
         for node in graph.nodes:
             role = str(self.nodes.get(node, MeshNode(node, {})).status.get("role", "client"))
             colors.append(ROLE_COLORS.get(role, "#95a5a6"))
 
-        if graph.number_of_nodes() > 0:
-            pos = nx.spring_layout(graph, seed=4)
-            nx.draw_networkx(
-                graph,
-                pos=pos,
-                node_color=colors,
-                with_labels=True,
-                edge_color="#7f8c8d",
-                ax=ax,
-                font_size=8,
-            )
+        if graph.number_of_nodes() == 0:
+            ax.text(0.5, 0.5, "No nodes found", ha='center', va='center', fontsize=14)
+            ax.axis("off")
+            self.canvas.draw_idle()
+            return
 
-        ax.set_title("Mesh topology")
+        # === УЛУЧШЕННОЕ РАЗМЕЩЕНИЕ ===
+        if len(graph.nodes) <= 8:
+            # Для малого количества узлов — размещаем по кругу (гораздо лучше видно)
+            pos = nx.circular_layout(graph)
+        else:
+            # Для большего количества — spring_layout с хорошими параметрами
+            pos = nx.spring_layout(graph, seed=42, k=0.5, iterations=50)
+
+        # Рисуем граф
+        nx.draw_networkx(
+            graph,
+            pos=pos,
+            node_color=colors,
+            with_labels=True,
+            edge_color="#7f8c8d",
+            node_size=1800,          # увеличил размер узлов
+            font_size=9,
+            font_weight="bold",
+            ax=ax,
+            linewidths=2,
+        )
+
+        # Красивые настройки вида
+        ax.set_title("Mesh topology", fontsize=14, pad=20)
         ax.axis("off")
+
+        # Автоматическое масштабирование, чтобы всё помещалось
+        ax.margins(0.15)   # добавляем отступы по краям
+
         self.canvas.draw_idle()
 
     def _selected_ip(self) -> str | None:
