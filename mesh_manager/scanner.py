@@ -5,33 +5,52 @@ import platform
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from .api import MeshApiError, get_status
+from api import MeshApiError, get_status
 
 
 def _ping_host(ip: str) -> bool:
-    """Пинг, который работает и на Windows, и на Linux"""
-    param = '-n' if platform.system().lower() == 'windows' else '-c'
-    timeout_flag = '-w' if platform.system().lower() == 'windows' else '-W'
+    """Кросс-платформенный пинг: работает и на Windows, и на Linux"""
+    import platform
     
+    system = platform.system().lower()
+    
+    if system == "windows":
+        # Windows версия
+        cmd = ['ping', '-n', '1', '-w', '1000', ip]   # 1 пакет, таймаут 1000 мс
+    else:
+        # Linux / Raspberry Pi версия
+        cmd = ['ping', '-c', '1', '-W', '1', ip]      # 1 пакет, таймаут 1 секунда
+
     try:
         result = subprocess.run(
-            ['ping', param, '1', timeout_flag, '1000', ip],   # 1 пакет, таймаут ~1 сек
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=3
+            timeout=3          # общий таймаут на всю команду
         )
         return result.returncode == 0
-    except:
+    except (subprocess.TimeoutExpired, Exception):
         return False
 
 
 def _query_node(ip: str) -> dict[str, Any] | None:
-    """Пытаемся получить статус по API"""
     try:
         payload = get_status(ip)
-        payload.setdefault("ip", ip)
+
+        raw_ip = payload.get("ip", ip)
+
+        # превращаем в список
+        if isinstance(raw_ip, str):
+            ip_list = raw_ip.split()
+        else:
+            ip_list = [raw_ip]
+
+        payload["ip"] = ip_list[0]  # основной IP
+        payload["all_ips"] = ip_list
+
         payload["configured"] = True
         return payload
+
     except MeshApiError:
         return None
 
@@ -83,4 +102,8 @@ def scan(subnet: str = "192.168.0", limit: int = 254) -> list[dict[str, Any]]:
                 })
 
     # Сортируем по IP
+    for n in nodes:
+        ip = n.get("ip", "")
+        print("DEBUG IP:", repr(ip))
+    
     return sorted(nodes, key=lambda n: tuple(map(int, n.get("ip", "0.0.0.0").split('.'))))

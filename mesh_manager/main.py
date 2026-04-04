@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 
-from .scanner import scan
-from .ui import run_app
+from scanner import scan
+from ui import run_app
 
 
 

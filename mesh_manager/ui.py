@@ -1,12 +1,16 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
-
+import paramiko
+import os
+from pathlib import Path
+from PySide6.QtWidgets import QInputDialog
 import networkx as nx
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QBrush
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,10 +25,10 @@ from PySide6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
-)
+    QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
-from .api import MeshApiError, get_topology, reboot_node
-from .scanner import scan
+from api import MeshApiError, get_topology, reboot_node
+from scanner import scan
 
 ROLE_COLORS = {
     "gateway": "#2ecc71",
@@ -114,6 +118,9 @@ class MeshManagerWindow(QMainWindow):
         self.auto_refresh.stateChanged.connect(self._toggle_auto_refresh)
         self.node_list.currentItemChanged.connect(self._show_selected_node)
         self.reboot_btn.clicked.connect(self._reboot_selected_node)
+        self.ssh_add_btn = QPushButton("➕ Добавить в Mesh по SSH")
+        self.ssh_add_btn.clicked.connect(self._add_node_via_ssh)
+        left_layout.addWidget(self.ssh_add_btn)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.start_scan)
@@ -176,8 +183,6 @@ class MeshManagerWindow(QMainWindow):
         current_ip = self._selected_ip()
         self.node_list.clear()
 
-        from PySide6.QtGui import QColor, QBrush
-        from PySide6.QtCore import Qt
 
         for ip, node in sorted(self.nodes.items()):
             configured = node.status.get("configured", True)
@@ -313,6 +318,363 @@ class MeshManagerWindow(QMainWindow):
             return
 
         QMessageBox.information(self, "Done", f"Restart command sent to {ip}")
+
+    def _add_node_via_ssh(self) -> None:
+        """Отправляем скрипт + apu.py. Mesh-настройка запускается каждый раз, сервисы — один раз."""
+        temp_ip = self._selected_ip()
+        if not temp_ip:
+            QMessageBox.warning(self, "Ошибка", "Сначала выбери [NEW] узел в списке")
+            return
+
+        node = self.nodes.get(temp_ip)
+        if not node or node.status.get("configured", True):
+            QMessageBox.warning(self, "Ошибка", "Выбранный узел уже настроен")
+            return
+
+        username, ok = QInputDialog.getText(self, "SSH", "Имя пользователя:", text="pi")
+        if not ok or not username:
+            return
+
+        password, ok = QInputDialog.getText(
+            self, "SSH", "Пароль:", text="raspberry", echo=QLineEdit.EchoMode.Password
+        )
+        if not ok or not password:
+            return
+        
+        role, ok = QInputDialog.getItem(
+            self,
+            "Выбор роли",
+            "Выберите роль узла:",
+            ["client", "gateway", "bridge"],
+            0,
+            False
+        )
+
+        if not ok:
+            return
+    
+
+        hostapd_config = {
+            "interface": "wlan1",
+            "bridge": "br0",
+            "ssid": "PI-Mesh",
+            "channel": "6",
+            "wpa_passphrase": "12345678"
+        }
+
+        if role == "bridge":
+            try:
+                # Получаем список доступных интерфейсов
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(temp_ip, username=username, password=password, timeout=10)
+
+                stdin, stdout, stderr = client.exec_command("iwconfig 2>/dev/null && ip -o link show")
+                output = stdout.read().decode() + stderr.read().decode()
+                client.close()
+
+                # Парсим интерфейсы
+                interfaces = []
+                for line in output.splitlines():
+                    if 'wlan' in line or 'eth' in line or 'end' in line:
+                        iface = line.split()[0].replace(':', '')
+                        if iface != 'wlan0' and iface != 'bat0' and iface != 'lo':
+                            interfaces.append(iface)
+
+                interfaces = list(dict.fromkeys(interfaces))  # убираем дубли
+
+                if not interfaces:
+                    interfaces = ["wlan1", "eth0", "end0"]
+
+                # Окно выбора интерфейса
+                iface, ok = QInputDialog.getItem(
+                    self,
+                    "Выбор интерфейса для Bridge",
+                    "Какой интерфейс использовать для Access Point?\n(wlan0 использовать нельзя)",
+                    interfaces,
+                    0,
+                    False
+                )
+                if not ok:
+                    return
+
+                hostapd_config["interface"] = iface
+
+            except Exception as e:
+                QMessageBox.warning(self, "Предупреждение", 
+                                f"Не удалось получить список интерфейсов:\n{str(e)}\n\n"
+                                "Используем wlan1 по умолчанию.")  
+
+        if role == "gateway":
+            mesh_ip = "192.168.199.1"
+        else:
+            mesh_subnet = "192.168.199"
+            used = [int(n.split(".")[-1]) for n in self.nodes if n.startswith(mesh_subnet)]
+            next_octet = max(used, default=4) + 1
+            if next_octet > 254:
+                QMessageBox.critical(self, "Ошибка", "Нет свободных IP в mesh-сети")
+                return
+            mesh_ip = f"{mesh_subnet}.{next_octet}"
+
+        
+        home = f"/home/{username}"
+        setup_path = f"{home}/setup-mesh.sh"
+        service_path = f"{home}/install-services.sh"
+        apu_path = f"{home}/apu.py"
+        hostapd_path = f"{home}/hostapd.conf"
+
+        # ==================== 1. MESH SCRIPT (запускается каждый раз) ====================
+        client_mesh_script = f"""#!/bin/bash
+
+# IP: {mesh_ip}
+
+
+sudo systemctl stop NetworkManager
+sudo systemctl stop wpa_supplicant
+sudo rfkill unblock wifi
+
+sudo batctl if add wlan0
+sudo ifconfig bat0 mtu 1468
+sudo batctl gw_mode client
+
+sudo ip link set wlan0 up
+
+sudo iwconfig wlan0 mode ad-hoc
+sudo iwconfig wlan0 channel 8
+sudo iwconfig wlan0 essid call-code-mesh
+
+sudo ip addr flush dev bat0
+sudo ip link set bat0 up
+sudo ip addr add {mesh_ip}/24 dev bat0
+sudo ip route add default via 192.168.199.1 dev bat0
+
+sudo mkdir -p /etc/mesh
+sudo echo "client" > /etc/mesh/role
+sudo echo "8" > /etc/mesh/channel
+sudo echo "call-code-mesh" > /etc/mesh/essid
+
+
+"""
+        gateway_mesh_script = f"""
+
+#!/bin/bash
+sudo rfkill unblock wifi
+sudo batctl if add wlan0
+sudo ifconfig bat0 mtu 1468
+
+sudo batctl gw_mode server
+
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+sudo iptables -A FORWARD -i eth0 -o bat0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A FORWARD -i bat0 -o eth0 -j ACCEPT
+
+sudo ip link set wlan0 up
+sudo iwconfig wlan0 mode ad-hoc
+sudo iwconfig wlan0 channel 8
+sudo iwconfig wlan0 essid call-code-mesh
+
+sudo ip link set bat0 up
+sleep 5
+sudo ip addr add 192.168.199.1/24 dev bat0
+sudo ip route add default via 192.168.199.1/24 dev bat0
+"""
+        bridge_mesh_script = f"""
+
+#!/bin/bash
+sleep 15
+
+sudo apt-get update -qq
+sudo apt-get install -y hostapd bridge-utils
+
+sudo rfkill unblock wifi
+sudo systemctl stop hostapd
+sudo systemctl stop NetworkManager
+sudo systemctl stop wpa_supplicant
+
+sudo batctl if add wlan0
+sudo ip link set wlan0 up
+sudo iwconfig wlan0 mode ad-hoc
+sudo iwconfig wlan0 channel 8
+sudo iwconfig wlan0 essid call-code-mesh
+
+sudo ip link set bat0 up
+sudo ifconfig bat0 mtu 1468
+
+sudo brctl addbr br0
+sudo ip link set eth0 up
+sudo brctl addif br0 eth0 bat0
+
+
+sudo ip link set br0 up
+
+sudo ip addr add {mesh_ip}/24 dev br0
+sudo ip route add default via 192.168.199.1 dev br0
+
+sudo batctl gw_mode client
+
+sleep 10
+
+sudo systemctl disable hostapd
+sudo systemctl restart dnsmasq
+sudo hostapd /home/{username}/hostapd.conf
+"""
+        service_script = f"""
+
+sudo tee /etc/systemd/system/mesh-setup.service > /dev/null <<'EOF'
+[Unit]
+Description=Call-Code Mesh Network Setup
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash {setup_path}
+RemainAfterExit=yes
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+
+sudo tee /etc/systemd/system/mesh-api.service > /dev/null <<'EOF'
+[Unit]
+Description=Call-Code Mesh API Server
+After=network.target mesh-setup.service
+
+[Service]
+Type=simple
+User={username}
+WorkingDirectory={home}
+ExecStart=/usr/bin/python3 {apu_path}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable mesh-setup.service
+sudo systemctl enable mesh-api.service
+"""
+        hostapd_content = f"""interface={hostapd_config['interface']}
+bridge={hostapd_config['bridge']}
+driver=nl80211
+ssid={hostapd_config['ssid']}
+channel={hostapd_config['channel']}
+wpa=2
+wpa_passphrase={hostapd_config['wpa_passphrase']}
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
+"""
+
+
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(temp_ip, username=username, password=password, timeout=15)
+            
+            if role=='client':
+                mesh_script = client_mesh_script
+            elif role=='gateway':
+                mesh_script = gateway_mesh_script
+            elif role== 'bridge':
+                mesh_script = bridge_mesh_script
+            sftp = client.open_sftp()
+
+            
+            import tempfile
+
+            # === setup script ===
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.sh', delete=False, encoding='utf-8', newline='\n'
+            ) as tmp_setup:
+                tmp_setup.write(mesh_script)
+                tmp_setup_path = tmp_setup.name
+
+            # === service script ===
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.sh', delete=False, encoding='utf-8', newline='\n'
+            ) as tmp_service:
+                tmp_service.write(service_script)
+                tmp_service_path = tmp_service.name
+
+            # === upload ===
+            sftp.put(tmp_setup_path, setup_path)
+            sftp.put(tmp_service_path, service_path)
+            if role == "bridge":
+                sftp.put(tmp_service_path, service_path)
+
+
+            # права
+            sftp.chmod(setup_path, 0o755)
+            sftp.chmod(service_path, 0o755)
+
+            # удаляем временные файлы
+            os.unlink(tmp_setup_path)
+            os.unlink(tmp_service_path)
+            
+            
+
+            # Загружаем apu.py
+            project_root = Path(__file__).parent.parent
+            local_apu_path = project_root / "apu.py"
+
+            if local_apu_path.exists():
+                sftp.put(str(local_apu_path), apu_path)
+            else:
+                QMessageBox.warning(self, "Предупреждение", "Файл apu.py не найден в корне проекта!")
+
+            if role=='bridge':
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False, encoding='utf-8', newline='\n') as tmp:
+                    tmp.write(hostapd_content)
+                    tmp_path = tmp.name
+                sftp.put(tmp_path, hostapd_path)
+                os.unlink(tmp_path)
+
+            sftp.close()
+
+            # Запускаем скрипт (он настроит mesh + создаст сервисы)
+            stdin, stdout, stderr = client.exec_command(f"sudo -S bash {service_path}")
+            stdin.write(password + "\n")
+            stdin.flush()
+
+            output = stdout.read().decode()
+            error = stderr.read().decode()
+
+            exit_status = stdout.channel.recv_exit_status()  
+
+            if exit_status != 0:
+                raise Exception("Ошибка выполнения setup-mesh.sh")
+
+            stdin, stdout, stderr = client.exec_command("sudo reboot")
+            stdin.write(password + "\n")
+            stdin.flush()
+
+            exit_status = stdout.channel.recv_exit_status()
+            client.close()
+
+            if exit_status == 0:
+                QMessageBox.information(
+                    self,
+                    "✅ Успех!",
+                    f"Узел успешно настроен!\n\n"
+                    f"Временный IP: {temp_ip}\n"
+                    f"Mesh IP: {mesh_ip}\n\n"
+                    f"✔ setup-mesh.sh создан и настроен на автозапуск\n"
+                    f"✔ apu.py загружен\n"
+                    f"✔ mesh-api.service запущен\n\n"
+                    f"Pi сейчас перезагружается..."
+                )
+            else:
+                QMessageBox.warning(self, "Предупреждение", f"Скрипт завершился с кодом {exit_status}")
+
+            self.start_scan()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка SSH", f"{str(e)}")
 
 
 def run_app() -> None:
