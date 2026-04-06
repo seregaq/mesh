@@ -13,6 +13,8 @@ from PySide6.QtGui import QColor, QBrush
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QProgressBar,
+    QComboBox,
     QCheckBox,
     QHBoxLayout,
     QLabel,
@@ -31,9 +33,10 @@ from api import MeshApiError, get_topology, reboot_node
 from scanner import scan
 
 ROLE_COLORS = {
-    "gateway": "#2ecc71",
-    "bridge": "#3498db",
-    "client": "#ecf0f1",
+    "gateway": "#8acc2e",
+    "bridge": "#134bac",
+    "client": "#81bbc9",
+    "unknown": "#ff0000",
 }
 
 
@@ -57,6 +60,60 @@ class ScanWorker(QObject):
             self.finished.emit(data, None)
         except Exception as exc:  # pragma: no cover - defensive fallback
             self.finished.emit([], str(exc))
+
+class NetworkCreateWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(bool, str)
+
+    def __init__(self, ips, roles, essid, channel, subnet, username, password):
+        super().__init__()
+        self.ips = ips
+        self.roles = roles
+        self.essid = essid
+        self.channel = channel
+        self.subnet = subnet
+        self.username = username
+        self.password = password
+
+    def run(self):
+        total = len(self.ips)
+
+        try:
+            for i, ip in enumerate(self.ips):
+                role = self.roles[ip]
+
+                percent = int((i / total) * 100)
+                self.progress.emit(percent, ip)
+
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(ip, username=self.username, password=self.password, timeout=10)
+
+                cmd = f"""
+            echo "{role}" | sudo tee /etc/mesh/role
+            echo "{self.essid}" | sudo tee /etc/mesh/essid
+            echo "{self.channel}" | sudo tee /etc/mesh/channel
+            echo "{self.subnet}" | sudo tee /etc/mesh/subnet
+            sudo systemctl restart mesh-setup.service
+            """
+
+                stdin, stdout, stderr = client.exec_command(cmd)
+                stdin.write(self.password + "\n")
+                stdin.flush()
+
+                if stdout.channel.recv_exit_status() != 0:
+                    raise Exception(f"{ip}: " + stderr.read().decode())
+
+                client.close()
+
+            # ✅ только если ВСЁ прошло успешно
+            self.progress.emit(100, "done")
+            self.finished.emit(True, "Сеть успешно создана")
+
+            
+
+        except Exception as e:
+            self.finished.emit(False, str(e))
 
 
 class MeshManagerWindow(QMainWindow):
@@ -90,12 +147,18 @@ class MeshManagerWindow(QMainWindow):
         controls.addWidget(self.auto_refresh)
         outer.addLayout(controls)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        outer.addWidget(self.progress_bar)
+
         splitter = QSplitter()
         outer.addWidget(splitter)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         self.node_list = QListWidget()
+        self.node_list.setSelectionMode(QListWidget.ExtendedSelection)  # разрешает выбирать несколько
         self.reboot_btn = QPushButton("Reboot selected node")
         self.details = QLabel("Select a node to see details")
         self.details.setWordWrap(True)
@@ -120,7 +183,14 @@ class MeshManagerWindow(QMainWindow):
         self.reboot_btn.clicked.connect(self._reboot_selected_node)
         self.ssh_add_btn = QPushButton("➕ Добавить в Mesh по SSH")
         self.ssh_add_btn.clicked.connect(self._add_node_via_ssh)
+        self.new_network_btn = QPushButton("🌐 Создать новую сеть")
+        self.new_network_btn.clicked.connect(self._create_new_network)
+        left_layout.addWidget(self.new_network_btn)
         left_layout.addWidget(self.ssh_add_btn)
+
+        self._progress_reset_timer = QTimer(self)
+        self._progress_reset_timer.setSingleShot(True)
+        self._progress_reset_timer.timeout.connect(self._reset_progress_bar)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.start_scan)
@@ -224,63 +294,77 @@ class MeshManagerWindow(QMainWindow):
         self._draw_graph()
 
     def _draw_graph(self) -> None:
-        """Рисует граф топологии с хорошим размещением и масштабированием"""
+        """Улучшенная отрисовка графа — красиво даже при 30–50 узлах"""
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         graph = nx.Graph()
 
-        # Добавляем все найденные узлы
         for ip in self.nodes:
             graph.add_node(ip)
 
-        # Добавляем связи (links), если они есть
+        # Добавляем реальные связи
         for link in self.links:
             source = link.get("source")
             target = link.get("target")
             if source and target:
                 graph.add_edge(source, target)
 
-        # Цвета узлов по роли
+        # Цвета по роли
         colors = []
         for node in graph.nodes:
             role = str(self.nodes.get(node, MeshNode(node, {})).status.get("role", "client"))
             colors.append(ROLE_COLORS.get(role, "#95a5a6"))
 
-        if graph.number_of_nodes() == 0:
-            ax.text(0.5, 0.5, "No nodes found", ha='center', va='center', fontsize=14)
+        n = graph.number_of_nodes()
+
+        if n == 0:
+            ax.text(0.5, 0.5, "No nodes found", ha='center', va='center', fontsize=16, color='gray')
             ax.axis("off")
             self.canvas.draw_idle()
             return
 
-        # === УЛУЧШЕННОЕ РАЗМЕЩЕНИЕ ===
-        if len(graph.nodes) <= 8:
-            # Для малого количества узлов — размещаем по кругу (гораздо лучше видно)
-            pos = nx.circular_layout(graph)
+        # === УМНЫЙ LAYOUT ===
+        if n <= 6:
+            pos = nx.circular_layout(graph)                    # идеальный круг
+        elif n <= 15:
+            pos = nx.kamada_kawai_layout(graph)                # красивые правильные фигуры
         else:
-            # Для большего количества — spring_layout с хорошими параметрами
-            pos = nx.spring_layout(graph, seed=42, k=0.5, iterations=50)
+            # Для большого количества — сильно разнесённый spring
+            pos = nx.spring_layout(graph, seed=42, k=1.8, iterations=120, scale=2.5)
 
-        # Рисуем граф
+        # Рисуем
         nx.draw_networkx(
             graph,
             pos=pos,
             node_color=colors,
             with_labels=True,
-            edge_color="#7f8c8d",
-            node_size=1800,          # увеличил размер узлов
+            edge_color="#2c3e50",
+            node_size=2400,
             font_size=9,
             font_weight="bold",
+            linewidths=3,
+            edgecolors="black",
             ax=ax,
-            linewidths=2,
         )
 
-        # Красивые настройки вида
-        ax.set_title("Mesh topology", fontsize=14, pad=20)
+        # Дополнительно подчёркиваем реальные связи (если они есть)
+        if len(self.links) > 0:
+            nx.draw_networkx_edges(
+                graph, pos, 
+                edgelist=[(link.get("source"), link.get("target")) for link in self.links if link.get("source") and link.get("target")],
+                edge_color="#e74c3c",
+                width=2.5,
+                alpha=0.9
+            )
+
+        ax.set_title(f"Mesh topology — {n} узлов", fontsize=16, pad=20)
         ax.axis("off")
 
-        # Автоматическое масштабирование, чтобы всё помещалось
-        ax.margins(0.15)   # добавляем отступы по краям
+        # Динамические отступы
+        margin = 0.25 if n <= 12 else 0.4
+        ax.margins(margin)
 
+        self.figure.tight_layout(pad=2.0)
         self.canvas.draw_idle()
 
     def _selected_ip(self) -> str | None:
@@ -336,7 +420,7 @@ class MeshManagerWindow(QMainWindow):
             return
 
         password, ok = QInputDialog.getText(
-            self, "SSH", "Пароль:", text="raspberry", echo=QLineEdit.EchoMode.Password
+            self, "SSH", "Пароль:", text="admin", echo=QLineEdit.EchoMode.Password
         )
         if not ok or not password:
             return
@@ -400,6 +484,42 @@ class MeshManagerWindow(QMainWindow):
 
                 hostapd_config["interface"] = iface
 
+                dialog = QDialog(self)
+                dialog.setWindowTitle("Настройка Bridge + Access Point")
+                dialog.resize(460, 340)
+
+                layout = QVBoxLayout(dialog)
+                form = QFormLayout()
+
+                interface_edit = QLineEdit(bridge_config["interface"])
+                bridge_edit = QLineEdit(bridge_config["bridge"])
+                ssid_edit = QLineEdit(bridge_config["ssid"])
+                channel_edit = QLineEdit(bridge_config["channel"])
+                passphrase_edit = QLineEdit(bridge_config["wpa_passphrase"])
+
+                form.addRow("Wireless Interface:", interface_edit)
+                form.addRow("Bridge name:", bridge_edit)
+                form.addRow("SSID точки доступа:", ssid_edit)
+                form.addRow("Channel:", channel_edit)
+                form.addRow("Пароль Wi-Fi:", passphrase_edit)
+
+                layout.addLayout(form)
+
+                buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                buttons.accepted.connect(dialog.accept)
+                buttons.rejected.connect(dialog.reject)
+                layout.addWidget(buttons)
+
+                if dialog.exec() == QDialog.Accepted:
+                    bridge_config = {
+                        "interface": interface_edit.text().strip() or "wlan1",
+                        "bridge": bridge_edit.text().strip() or "br0",
+                        "ssid": ssid_edit.text().strip() or "PI-Mesh",
+                        "channel": channel_edit.text().strip() or "6",
+                        "wpa_passphrase": passphrase_edit.text().strip() or "12345678"
+                    }
+
+
             except Exception as e:
                 QMessageBox.warning(self, "Предупреждение", 
                                 f"Не удалось получить список интерфейсов:\n{str(e)}\n\n"
@@ -458,6 +578,8 @@ sudo echo "call-code-mesh" > /etc/mesh/essid
         gateway_mesh_script = f"""
 
 #!/bin/bash
+sudo systemctl disable NetworkManager
+sudo systemctl disable wpa_supplicant
 sudo rfkill unblock wifi
 sudo batctl if add wlan0
 sudo ifconfig bat0 mtu 1468
@@ -478,6 +600,11 @@ sudo ip link set bat0 up
 sleep 5
 sudo ip addr add 192.168.199.1/24 dev bat0
 sudo ip route add default via 192.168.199.1/24 dev bat0
+
+sudo mkdir -p /etc/mesh
+sudo echo "gateway" > /etc/mesh/role
+sudo echo "8" > /etc/mesh/channel
+sudo echo "call-code-mesh" > /etc/mesh/essid
 """
         bridge_mesh_script = f"""
 
@@ -518,6 +645,12 @@ sleep 10
 sudo systemctl disable hostapd
 sudo systemctl restart dnsmasq
 sudo hostapd /home/{username}/hostapd.conf
+
+sudo mkdir -p /etc/mesh
+sudo echo "bridge" > /etc/mesh/role
+sudo echo "8" > /etc/mesh/channel
+sudo echo "call-code-mesh" > /etc/mesh/essid
+
 """
         service_script = f"""
 
@@ -676,6 +809,114 @@ rsn_pairwise=CCMP
         except Exception as e:
             QMessageBox.critical(self, "Ошибка SSH", f"{str(e)}")
 
+
+    def _create_new_network(self) -> None:
+        selected_items = self.node_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Ошибка", "Выберите узлы")
+            return
+
+        selected_ips = [item.data(1) for item in selected_items]
+
+        # === диалог ===
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Новая mesh сеть")
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        essid_edit = QLineEdit("mesh-new")
+        channel_edit = QLineEdit("1")
+        subnet_edit = QLineEdit("192.168.199")
+
+        form.addRow("ESSID:", essid_edit)
+        form.addRow("Channel:", channel_edit)
+        form.addRow("Подсеть:", subnet_edit)
+
+        layout.addLayout(form)
+
+        role_widgets = {}
+
+        for ip in selected_ips:
+            combo = QComboBox()
+            combo.addItems(["client", "gateway", "bridge"])
+            role_widgets[ip] = combo
+
+            layout.addWidget(QLabel(ip))
+            layout.addWidget(combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        essid = essid_edit.text().strip()
+        channel = channel_edit.text().strip()
+        subnet = subnet_edit.text().strip()
+
+        # === подтверждение ===
+        msg = "\n".join(selected_ips)
+        reply = QMessageBox.question(
+            self,
+            "Подтверждение",
+            f"Подключение по SSH к:\n\n{msg}\n\nПродолжить?",
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        username, ok = QInputDialog.getText(self, "SSH", "User:", text="pi")
+        if not ok:
+            return
+
+        password, ok = QInputDialog.getText(
+            self, "SSH", "Password:", echo=QLineEdit.Password
+        )
+        if not ok:
+            return
+
+        roles = {ip: role_widgets[ip].currentText() for ip in selected_ips}
+
+        # === поток ===
+        self._net_thread = QThread()
+        self._net_worker = NetworkCreateWorker(
+            selected_ips, roles, essid, channel, subnet, username, password
+        )
+
+        self._net_worker.moveToThread(self._net_thread)
+
+        self._net_thread.started.connect(self._net_worker.run)
+        self._net_worker.progress.connect(self._on_net_progress)
+        self._net_worker.finished.connect(self._on_net_finished)
+
+        self._net_worker.finished.connect(self._net_thread.quit)
+        self._net_thread.finished.connect(self._net_thread.deleteLater)
+
+        self.progress_bar.setValue(0)
+        self._net_thread.start()
+
+    def _on_net_progress(self, percent, ip):
+        self.progress_bar.setValue(percent)
+        self.progress_bar.setFormat(f"{ip} ({percent}%)")
+
+    def _reset_progress_bar(self):
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+
+    def _on_net_finished(self, success, message):
+        if success:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("Готово (100%)")
+            QMessageBox.information(self, "Готово", message)
+            self.start_scan()
+        else:
+            self.progress_bar.setFormat("Ошибка")
+            QMessageBox.critical(self, "Ошибка", message)
+
+        # ✅ запускаем авто-сброс через 6 секунд
+        self._progress_reset_timer.start(6000)
 
 def run_app() -> None:
     app = QApplication.instance() or QApplication([])

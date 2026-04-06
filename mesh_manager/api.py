@@ -31,12 +31,42 @@ def get_status(ip: str) -> Dict[str, Any]:
         raise MeshApiError(f"Нет ответа от {ip}: {e}")
 
 
-def get_topology(ip: str, timeout: float = 1.0) -> Dict[str, Any]:
-    """Твоего /topology пока нет — возвращаем пустую топологию"""
-    return {
-        "nodes": [ip],
-        "links": []
-    }
+def get_topology(ip: str, timeout: float = 2.0) -> Dict[str, Any]:
+    """Получаем реальную топологию через batctl tr"""
+    try:
+        r = requests.get(f"http://{ip}:5000/neighbors", timeout=timeout)
+        if r.status_code != 200:
+            return {"nodes": [ip], "links": []}
+
+        data = r.json()
+        raw = data.get("neighbors_raw", "")
+
+        links = []
+        current_node = ip
+
+        # Парсим вывод batctl n / tr
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("B.A.T.M.A.N.") or "Originator" in line:
+                continue
+
+            # Пример строки batctl n:
+            # 192.168.199.5   1.000   1.000   1.000   0   0   0   0
+            parts = line.split()
+            if len(parts) >= 2:
+                target = parts[0]
+                if target != current_node and target.startswith("192.168.199"):
+                    # Простая связь (можно позже добавить TQ)
+                    links.append({"source": current_node, "target": target})
+
+        return {
+            "nodes": [ip],
+            "links": links
+        }
+
+    except Exception:
+        # Если не получилось — хотя бы вернём сам узел
+        return {"nodes": [ip], "links": []}
 
 
 def reboot_node(ip: str) -> Dict[str, Any]:
