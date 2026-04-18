@@ -8,7 +8,7 @@ class MeshApiError(Exception):
 def get_status(ip: str) -> Dict[str, Any]:
     """Получаем статус — используем твой текущий /status + /info"""
     try:
-        # Сначала пробуем /info (у тебя он богаче)
+       
         r = requests.get(f"http://{ip}:5000/info", timeout=3)
         if r.status_code == 200:
             data = r.json()
@@ -31,43 +31,24 @@ def get_status(ip: str) -> Dict[str, Any]:
         raise MeshApiError(f"Нет ответа от {ip}: {e}")
 
 
-def get_topology(ip: str, timeout: float = 2.0) -> Dict[str, Any]:
-    """Получаем реальную топологию через batctl tr"""
+def get_topology(ip: str, timeout: float = 3.0) -> Dict[str, Any]:
+    """Получаем реальные связи через batctl tr (с MAC → IP)"""
     try:
-        r = requests.get(f"http://{ip}:5000/neighbors", timeout=timeout)
-        if r.status_code != 200:
-            return {"nodes": [ip], "links": []}
-
-        data = r.json()
-        raw = data.get("neighbors_raw", "")
-
-        links = []
-        current_node = ip
-
-        # Парсим вывод batctl n / tr
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("B.A.T.M.A.N.") or "Originator" in line:
-                continue
-
-            # Пример строки batctl n:
-            # 192.168.199.5   1.000   1.000   1.000   0   0   0   0
-            parts = line.split()
-            if len(parts) >= 2:
-                target = parts[0]
-                if target != current_node and target.startswith("192.168.199"):
-                    # Простая связь (можно позже добавить TQ)
-                    links.append({"source": current_node, "target": target})
-
-        return {
-            "nodes": [ip],
-            "links": links
-        }
-
-    except Exception:
-        # Если не получилось — хотя бы вернём сам узел
-        return {"nodes": [ip], "links": []}
-
+        # Запрашиваем у любого узла (лучше у gateway)
+        r = requests.get(
+            f"http://{ip}:5000/topology", 
+            params={"gateway": "192.168.199.1"}, 
+            timeout=timeout
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "links": data.get("links", []),
+                "raw": data.get("raw_trace", "")
+            }
+        return {"links": []}
+    except:
+        return {"links": []}
 
 def reboot_node(ip: str) -> Dict[str, Any]:
     """Перезагрузка — используем твой /restart_point"""

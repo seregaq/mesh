@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any
 import paramiko
 import os
+import matplotlib.pyplot as plt
 from pathlib import Path
 from PySide6.QtWidgets import QInputDialog
 import networkx as nx
@@ -36,6 +37,7 @@ ROLE_COLORS = {
     "gateway": "#8acc2e",
     "bridge": "#134bac",
     "client": "#81bbc9",
+    "ap": "#f39c12",
     "unknown": "#ff0000",
 }
 
@@ -58,7 +60,7 @@ class ScanWorker(QObject):
         try:
             data = scan(subnet=self.subnet, limit=self.limit)
             self.finished.emit(data, None)
-        except Exception as exc:  # pragma: no cover - defensive fallback
+        except Exception as exc:  
             self.finished.emit([], str(exc))
 
 class NetworkCreateWorker(QObject):
@@ -106,7 +108,6 @@ class NetworkCreateWorker(QObject):
 
                 client.close()
 
-            # ✅ только если ВСЁ прошло успешно
             self.progress.emit(100, "done")
             self.finished.emit(True, "Сеть успешно создана")
 
@@ -124,9 +125,11 @@ class MeshManagerWindow(QMainWindow):
 
         self.nodes: dict[str, MeshNode] = {}
         self.links: list[dict[str, str]] = []
+        self.paths: list[dict[str, str]] = []
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
         self._scan_in_progress = False
+        self.topology_mode = "all"
 
         root = QWidget(self)
         self.setCentralWidget(root)
@@ -136,12 +139,19 @@ class MeshManagerWindow(QMainWindow):
 
         self.subnet_input = QLineEdit("192.168.199")
         self.limit_input = QLineEdit("50")
-        self.scan_btn = QPushButton("Scan")
-        self.auto_refresh = QCheckBox("Auto refresh (2s)")
+        self.scan_btn = QPushButton("Сканировать")
+        self.auto_refresh = QCheckBox("Авто обновление (2s)")
 
-        controls.addWidget(QLabel("Subnet:"))
+        self.topology_mode_combo = QComboBox()
+        self.topology_mode_combo.addItems(["Все связи (batctl n)", "Пути до Gateway (batctl tr)"])
+        self.topology_mode_combo.setCurrentIndex(0)  # по умолчанию "Все связи"
+        self.topology_mode_combo.currentIndexChanged.connect(self._on_topology_mode_changed)
+        controls.addWidget(QLabel("Топология:"))
+        controls.addWidget(self.topology_mode_combo)
+
+        controls.addWidget(QLabel("Подсеть:"))
         controls.addWidget(self.subnet_input)
-        controls.addWidget(QLabel("Limit:"))
+        controls.addWidget(QLabel("Лимит:"))
         controls.addWidget(self.limit_input)
         controls.addWidget(self.scan_btn)
         controls.addWidget(self.auto_refresh)
@@ -158,9 +168,9 @@ class MeshManagerWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         self.node_list = QListWidget()
-        self.node_list.setSelectionMode(QListWidget.ExtendedSelection)  # разрешает выбирать несколько
-        self.reboot_btn = QPushButton("Reboot selected node")
-        self.details = QLabel("Select a node to see details")
+        self.node_list.setSelectionMode(QListWidget.ExtendedSelection)  
+        self.reboot_btn = QPushButton("Перезагрузить выбранный узел")
+        self.details = QLabel("Выберите узел, чтобы увидеть больше информации")
         self.details.setWordWrap(True)
 
         left_layout.addWidget(self.node_list)
@@ -185,6 +195,9 @@ class MeshManagerWindow(QMainWindow):
         self.ssh_add_btn.clicked.connect(self._add_node_via_ssh)
         self.new_network_btn = QPushButton("🌐 Создать новую сеть")
         self.new_network_btn.clicked.connect(self._create_new_network)
+        self.orange_ap_btn = QPushButton("🍊 Добавить Orange в роли AP")
+        self.orange_ap_btn.clicked.connect(self._add_orange_as_ap)
+        left_layout.addWidget(self.orange_ap_btn)
         left_layout.addWidget(self.new_network_btn)
         left_layout.addWidget(self.ssh_add_btn)
 
@@ -211,13 +224,38 @@ class MeshManagerWindow(QMainWindow):
         return subnet, limit
 
     def start_scan(self) -> None:
+
+
+
+            # === DEBUG MODE ===
+        self.nodes = {
+            "192.168.199.1": MeshNode("192.168.199.1", {"role": "gateway"}),
+            "192.168.199.2": MeshNode("192.168.199.2", {"role": "client"}),
+            "192.168.199.3": MeshNode("192.168.199.3", {"role": "client"}),
+            "192.168.199.4": MeshNode("192.168.199.4", {"role": "bridge"}),
+            "192.168.199.5": MeshNode("192.168.199.5", {"role": "ap"}),
+        }
+
+        self.links = [
+            {"source": "192.168.199.1", "target": "192.168.199.2", "tq": 255},
+            {"source": "192.168.199.1", "target": "192.168.199.3", "tq": 180},
+            {"source": "192.168.199.2", "target": "192.168.199.4", "tq": 120},
+            {"source": "192.168.199.3", "target": "192.168.199.4", "tq": 200},
+            {"source": "192.168.199.4", "target": "192.168.199.5", "tq": 90},
+        ]
+
+        self._refresh_node_list()
+        self._draw_graph()
+        return
+    
+    
         if self._scan_in_progress:
             return
 
         subnet, limit = self._get_scan_params()
         self._scan_in_progress = True
         self.scan_btn.setEnabled(False)
-        self.scan_btn.setText("Scanning...")
+        self.scan_btn.setText("Сканирование...")
 
         self._scan_thread = QThread(self)
         self._scan_worker = ScanWorker(subnet=subnet, limit=limit)
@@ -231,9 +269,9 @@ class MeshManagerWindow(QMainWindow):
     def _on_scan_finished(self, data: list[dict[str, Any]], error: str | None) -> None:
         self._scan_in_progress = False
         self.scan_btn.setEnabled(True)
-        self.scan_btn.setText("Scan")
+        self.scan_btn.setText("Сканировать")
         if error:
-            QMessageBox.critical(self, "Scan failed", error)
+            QMessageBox.critical(self, "Ошибка сканирования", error)
             return
 
         self.nodes = {node["ip"]: MeshNode(ip=node["ip"], status=node) for node in data if "ip" in node}
@@ -256,22 +294,21 @@ class MeshManagerWindow(QMainWindow):
 
         for ip, node in sorted(self.nodes.items()):
             configured = node.status.get("configured", True)
-            role = str(node.status.get("role", "client"))
+            role = str(node.status.get("role", "unknown"))
 
             if configured:
                 text = f"{ip}  ({role})"
                 item = QListWidgetItem(text)
-                item.setBackground(QBrush(QColor(255, 255, 255)))  # белый фон
+                item.setBackground(QBrush(QColor(255, 255, 255)))  
             else:
                 text = f"🔴 [NEW] {ip}  — запустите скрипт настройки"
                 item = QListWidgetItem(text)
-                # Красный фон для новых узлов
-                item.setBackground(QBrush(QColor(255, 220, 220)))   # светло-красный
+                item.setBackground(QBrush(QColor(255, 220, 220)))   
 
-            item.setData(1, ip)        # храним IP в данных элемента
+            item.setData(1, ip)        
             self.node_list.addItem(item)
 
-        # Восстанавливаем предыдущий выбор
+        
         if current_ip:
             for i in range(self.node_list.count()):
                 item = self.node_list.item(i)
@@ -281,35 +318,76 @@ class MeshManagerWindow(QMainWindow):
 
     def _refresh_topology(self) -> None:
         self.links = []
-        for ip in self.nodes:
-            try:
-                topo = get_topology(ip, timeout=0.35)
-                if isinstance(topo.get("links"), list):
-                    self.links.extend(topo["links"])
-                if self.links:
-                    break
-            except MeshApiError:
-                continue
+        self.paths = []
+
+        gateway_ip = None
+        for ip, node in self.nodes.items():
+            if node.status.get("role") == "gateway":
+                gateway_ip = ip
+                break
+
+        if not gateway_ip:
+            self._draw_graph()
+            return
+
+        try:
+            topo = get_topology(gateway_ip)
+
+            if self.topology_mode == "all":
+                self.links = topo.get("links", [])
+
+            elif self.topology_mode == "trace":
+                self.paths = topo.get("paths", [])
+
+        except Exception as e:
+            print("Topology error:", e)
 
         self._draw_graph()
 
+    def _on_topology_mode_changed(self) -> None:
+        current_text = self.topology_mode_combo.currentText()
+        self.topology_mode = "trace" if "Gateway" in current_text else "all"
+        self._refresh_topology()   # сразу обновляем граф
+
     def _draw_graph(self) -> None:
-        """Улучшенная отрисовка графа — красиво даже при 30–50 узлах"""
+
         self.figure.clear()
         ax = self.figure.add_subplot(111)
+
         graph = nx.Graph()
 
+        # === добавляем узлы ===
         for ip in self.nodes:
             graph.add_node(ip)
 
-        # Добавляем реальные связи
-        for link in self.links:
-            source = link.get("source")
-            target = link.get("target")
-            if source and target:
-                graph.add_edge(source, target)
+        # === готовим рёбра ===
+        edges = []
+        weights = []
 
-        # Цвета по роли
+        if self.topology_mode == "all":
+            for link in self.links:
+                source = link.get("source")
+                target = link.get("target")
+                tq = link.get("tq", 0)
+
+                if source in self.nodes and target in self.nodes:
+                    edges.append((source, target))
+                    weights.append(tq / 255 if tq else 0.1)
+
+        elif self.topology_mode == "trace":
+            for path in self.paths:
+                # path = ["192.168.199.5", "192.168.199.4", "192.168.199.1"]
+                for i in range(len(path) - 1):
+                    a = path[i]
+                    b = path[i + 1]
+
+                    if a in self.nodes and b in self.nodes:
+                        edges.append((a, b))
+                        weights.append(1.0)  # можно фиксированный вес
+
+        graph.add_edges_from(edges)
+
+        # === цвета узлов ===
         colors = []
         for node in graph.nodes:
             role = str(self.nodes.get(node, MeshNode(node, {})).status.get("role", "client"))
@@ -323,44 +401,51 @@ class MeshManagerWindow(QMainWindow):
             self.canvas.draw_idle()
             return
 
-        # === УМНЫЙ LAYOUT ===
+        # === layout ===
         if n <= 6:
-            pos = nx.circular_layout(graph)                    # идеальный круг
+            pos = nx.circular_layout(graph)
         elif n <= 15:
-            pos = nx.kamada_kawai_layout(graph)                # красивые правильные фигуры
+            pos = nx.kamada_kawai_layout(graph)
         else:
-            # Для большого количества — сильно разнесённый spring
             pos = nx.spring_layout(graph, seed=42, k=1.8, iterations=120, scale=2.5)
 
-        # Рисуем
-        nx.draw_networkx(
+        # === рисуем узлы ===
+        nx.draw_networkx_nodes(
             graph,
-            pos=pos,
+            pos,
             node_color=colors,
-            with_labels=True,
-            edge_color="#2c3e50",
-            node_size=2400,
-            font_size=9,
-            font_weight="bold",
-            linewidths=3,
+            node_size=7600,
             edgecolors="black",
+            linewidths=3,
             ax=ax,
         )
 
-        # Дополнительно подчёркиваем реальные связи (если они есть)
-        if len(self.links) > 0:
+        # === подписи ===
+        nx.draw_networkx_labels(
+            graph,
+            pos,
+            font_size=9,
+            font_weight="bold",
+            ax=ax
+        )
+
+        # === рисуем рёбра (с качеством) ===
+        if edges:
             nx.draw_networkx_edges(
-                graph, pos, 
-                edgelist=[(link.get("source"), link.get("target")) for link in self.links if link.get("source") and link.get("target")],
-                edge_color="#e74c3c",
-                width=2.5,
-                alpha=0.9
+                graph,
+                pos,
+                edgelist=edges,
+                width=[1 + w * 4 for w in weights],   # толщина зависит от tq
+                edge_color=weights,                  # цвет по tq
+                edge_cmap=plt.cm.RdYlGn,             # красный → зелёный
+                alpha=0.9,
+                ax=ax
             )
 
         ax.set_title(f"Mesh topology — {n} узлов", fontsize=16, pad=20)
         ax.axis("off")
 
-        # Динамические отступы
+        # === отступы ===
         margin = 0.25 if n <= 12 else 0.4
         ax.margins(margin)
 
@@ -404,7 +489,6 @@ class MeshManagerWindow(QMainWindow):
         QMessageBox.information(self, "Done", f"Restart command sent to {ip}")
 
     def _add_node_via_ssh(self) -> None:
-        """Отправляем скрипт + apu.py. Mesh-настройка запускается каждый раз, сервисы — один раз."""
         temp_ip = self._selected_ip()
         if not temp_ip:
             QMessageBox.warning(self, "Ошибка", "Сначала выбери [NEW] узел в списке")
@@ -448,7 +532,6 @@ class MeshManagerWindow(QMainWindow):
 
         if role == "bridge":
             try:
-                # Получаем список доступных интерфейсов
                 client = paramiko.SSHClient()
                 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 client.connect(temp_ip, username=username, password=password, timeout=10)
@@ -457,7 +540,6 @@ class MeshManagerWindow(QMainWindow):
                 output = stdout.read().decode() + stderr.read().decode()
                 client.close()
 
-                # Парсим интерфейсы
                 interfaces = []
                 for line in output.splitlines():
                     if 'wlan' in line or 'eth' in line or 'end' in line:
@@ -470,7 +552,7 @@ class MeshManagerWindow(QMainWindow):
                 if not interfaces:
                     interfaces = ["wlan1", "eth0", "end0"]
 
-                # Окно выбора интерфейса
+
                 iface, ok = QInputDialog.getItem(
                     self,
                     "Выбор интерфейса для Bridge",
@@ -543,7 +625,7 @@ class MeshManagerWindow(QMainWindow):
         apu_path = f"{home}/apu.py"
         hostapd_path = f"{home}/hostapd.conf"
 
-        # ==================== 1. MESH SCRIPT (запускается каждый раз) ====================
+
         client_mesh_script = f"""#!/bin/bash
 
 # IP: {mesh_ip}
@@ -740,8 +822,6 @@ rsn_pairwise=CCMP
             if role == "bridge":
                 sftp.put(tmp_service_path, service_path)
 
-
-            # права
             sftp.chmod(setup_path, 0o755)
             sftp.chmod(service_path, 0o755)
 
@@ -749,9 +829,6 @@ rsn_pairwise=CCMP
             os.unlink(tmp_setup_path)
             os.unlink(tmp_service_path)
             
-            
-
-            # Загружаем apu.py
             project_root = Path(__file__).parent.parent
             local_apu_path = project_root / "apu.py"
 
@@ -769,7 +846,7 @@ rsn_pairwise=CCMP
 
             sftp.close()
 
-            # Запускаем скрипт (он настроит mesh + создаст сервисы)
+  
             stdin, stdout, stderr = client.exec_command(f"sudo -S bash {service_path}")
             stdin.write(password + "\n")
             stdin.flush()
@@ -809,6 +886,136 @@ rsn_pairwise=CCMP
         except Exception as e:
             QMessageBox.critical(self, "Ошибка SSH", f"{str(e)}")
 
+    def _add_orange_as_ap(self) -> None:
+
+        temp_ip = self._selected_ip()
+        if not temp_ip:
+            QMessageBox.warning(self, "Ошибка", "Сначала выбери [NEW] узел в списке")
+            return
+
+        node = self.nodes.get(temp_ip)
+        if not node or node.status.get("configured", True):
+            QMessageBox.warning(self, "Ошибка", "Выбранный узел уже настроен")
+            return
+
+        username, ok = QInputDialog.getText(self, "SSH", "Имя пользователя:", text="pi")
+        if not ok or not username:
+            return
+
+        password, ok = QInputDialog.getText(
+            self, "SSH", "Пароль:", text="admin", echo=QLineEdit.EchoMode.Password
+        )
+        if not ok or not password:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Настройка Access Point (hostapd)")
+        dialog.resize(480, 360)
+
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        interface_edit = QLineEdit("wlan0")
+        ssid_edit = QLineEdit("Orange-Mesh")
+        channel_edit = QLineEdit("6")
+        passphrase_edit = QLineEdit("12345678")
+
+        form.addRow("Wireless Interface:", interface_edit)
+        form.addRow("SSID точки доступа:", ssid_edit)
+        form.addRow("Channel:", channel_edit)
+        form.addRow("Пароль Wi-Fi (WPA2):", passphrase_edit)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        config = {
+            "interface": interface_edit.text().strip() or "wlan0",
+            "ssid": ssid_edit.text().strip() or "Orange-Mesh",
+            "channel": channel_edit.text().strip() or "6",
+            "wpa_passphrase": passphrase_edit.text().strip() or "12345678"
+        }
+
+        hostapd_path = "/etc/hostapd/hostapd.conf"
+
+        hostapd_content = f"""interface={config['interface']}
+    driver=nl80211
+    ssid={config['ssid']}
+    hw_mode=g
+    channel={config['channel']}
+    wpa=2
+    wpa_passphrase={config['wpa_passphrase']}
+    wpa_key_mgmt=WPA-PSK
+    rsn_pairwise=CCMP"""
+        
+        dnsmasq_append = f"""
+interface={config['interface']}
+dhcp-range=10.0.0.10,10.0.0.100,255.255.255.0,24h
+dhcp-option=6,8.8.8.8,1.1.1.1
+"""
+
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(temp_ip, username=username, password=password, timeout=15)
+
+            cmd_write_config = f"sudo tee {hostapd_path}"
+            stdin, stdout, stderr = client.exec_command(cmd_write_config)
+            stdin.write(hostapd_content)
+            stdin.close()
+
+            cmd_set_daemon = """
+    sudo sed -i 's|#DAEMON_CONF=.*|DAEMON_CONF="/etc/hostapd/hostapd.conf"|' /etc/default/hostapd
+    """
+            stdin, stdout, stderr = client.exec_command(cmd_set_daemon)
+            stdin.write(password + "\n")
+            stdin.flush()
+
+            cmd_kill_conflicts = """
+    sudo systemctl stop wpa_supplicant
+    sudo systemctl stop NetworkManager
+    """
+            stdin, stdout, stderr = client.exec_command(cmd_kill_conflicts)
+            stdin.write(password + "\n")
+            stdin.flush()
+
+            cmd_restart = f"""
+    sudo systemctl stop hostapd
+    echo '{dnsmasq_append}' | sudo tee -a /etc/dnsmasq.conf
+    sudo systemctl restart hostapd
+    sudo systemctl unmask hostapd
+    sudo systemctl enable hostapd
+    sudo systemctl restart hostapd
+    sudo mkdir -p /etc/mesh
+    echo "ap" | sudo tee /etc/mesh/role
+    """
+            stdin, stdout, stderr = client.exec_command(cmd_restart)
+            stdin.write(password + "\n")
+            stdin.flush()
+
+            client.close()
+
+            QMessageBox.information(
+                self,
+                "✅ Успех!",
+                f"Orange Pi настроен как Access Point!\n\n"
+                f"IP: {temp_ip}\n"
+                f"SSID: {config['ssid']}\n"
+                f"Channel: {config['channel']}\n"
+                f"Пароль: {config['wpa_passphrase']}\n\n"
+                f"hostapd перезапущен"
+            )
+
+            self.start_scan()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка SSH", str(e))
 
     def _create_new_network(self) -> None:
         selected_items = self.node_list.selectedItems()
@@ -915,7 +1122,6 @@ rsn_pairwise=CCMP
             self.progress_bar.setFormat("Ошибка")
             QMessageBox.critical(self, "Ошибка", message)
 
-        # ✅ запускаем авто-сброс через 6 секунд
         self._progress_reset_timer.start(6000)
 
 def run_app() -> None:
