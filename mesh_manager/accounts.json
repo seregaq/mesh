@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "username": "admin",
+      "role": "admin",
+      "salt": "V18vgKStHk9k+N47ruxQwA==",
+      "password_hash": "na56GTgYrg/Ie2HwGhozaUM2KzEIB2dhGN0t3LDP/O8="
+    },
+    {
+      "username": "operator",
+      "role": "viewer",
+      "salt": "g0hsgDacFg1Sm9ir04oXJw==",
+      "password_hash": "vMR2BlcrBSLo29z35Z6Od95BtuhN05L9sVyZrpm5Jak="
+    }
+  ]
+}

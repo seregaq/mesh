@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
 from api import MeshApiError, get_topology, reboot_node
+from auth import LoginDialog
 from scanner import scan
 from network_logs import build_network_log_payload, save_network_logs_json
 
@@ -43,7 +44,6 @@ ROLE_COLORS = {
     "ap": "#f39c12",
     "unknown": "#ff0000",
 }
-
 
 @dataclass
 class MeshNode:
@@ -121,9 +121,12 @@ class NetworkCreateWorker(QObject):
 
 
 class MeshManagerWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, username: str, role: str) -> None:
         super().__init__()
-        self.setWindowTitle("Mesh Manager")
+        self.current_username = username
+        self.current_role = role
+        self.is_admin = self.current_role == "admin"
+        self.setWindowTitle(f"Mesh Manager — {self.current_username} ({self.current_role})")
         self.resize(1200, 720)
 
         self.nodes: dict[str, MeshNode] = {}
@@ -214,6 +217,22 @@ class MeshManagerWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.start_scan)
+        self._apply_permissions()
+
+    def _apply_permissions(self) -> None:
+        if self.is_admin:
+            return
+        self.reboot_btn.setEnabled(False)
+        self.ssh_add_btn.setEnabled(False)
+        self.new_network_btn.setEnabled(False)
+        self.orange_ap_btn.setEnabled(False)
+        self.setStatusTip("Режим только чтение: изменение конфигурации доступно только admin.")
+
+    def _ensure_admin(self) -> bool:
+        if self.is_admin:
+            return True
+        QMessageBox.warning(self, "Недостаточно прав", "Это действие доступно только для admin.")
+        return False
 
     def _toggle_auto_refresh(self) -> None:
         if self.auto_refresh.isChecked():
@@ -506,6 +525,8 @@ class MeshManagerWindow(QMainWindow):
         self.details.setText("\n".join(lines))
 
     def _reboot_selected_node(self) -> None:
+        if not self._ensure_admin():
+            return
         ip = self._selected_ip()
         if not ip:
             QMessageBox.warning(self, "No node selected", "Choose a node first")
@@ -520,6 +541,8 @@ class MeshManagerWindow(QMainWindow):
         QMessageBox.information(self, "Done", f"Restart command sent to {ip}")
 
     def _add_node_via_ssh(self) -> None:
+        if not self._ensure_admin():
+            return
         temp_ip = self._selected_ip()
         if not temp_ip:
             QMessageBox.warning(self, "Ошибка", "Сначала выбери [NEW] узел в списке")
@@ -918,6 +941,8 @@ rsn_pairwise=CCMP
             QMessageBox.critical(self, "Ошибка SSH", f"{str(e)}")
 
     def _add_orange_as_ap(self) -> None:
+        if not self._ensure_admin():
+            return
 
         temp_ip = self._selected_ip()
         if not temp_ip:
@@ -1049,6 +1074,8 @@ dhcp-option=6,8.8.8.8,1.1.1.1
             QMessageBox.critical(self, "Ошибка SSH", str(e))
 
     def _create_new_network(self) -> None:
+        if not self._ensure_admin():
+            return
         selected_items = self.node_list.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "Ошибка", "Выберите узлы")
@@ -1157,7 +1184,14 @@ dhcp-option=6,8.8.8.8,1.1.1.1
 
 def run_app() -> None:
     app = QApplication.instance() or QApplication([])
-    window = MeshManagerWindow()
+    auth_dialog = LoginDialog()
+    if auth_dialog.exec() != QDialog.Accepted or not auth_dialog.account:
+        return
+
+    window = MeshManagerWindow(
+        username=auth_dialog.account["username"],
+        role=auth_dialog.account.get("role", "viewer"),
+    )
     window.show()
     window.start_scan()
     app.exec()
