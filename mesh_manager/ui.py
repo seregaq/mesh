@@ -6,6 +6,7 @@ import os
 import matplotlib.pyplot as plt
 from pathlib import Path
 from PySide6.QtWidgets import QInputDialog
+from datetime import datetime
 import networkx as nx
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -26,12 +27,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QFileDialog,
     QVBoxLayout,
     QWidget,
     QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
 from api import MeshApiError, get_topology, reboot_node
 from scanner import scan
+from network_logs import build_network_log_payload, save_network_logs_json
 
 ROLE_COLORS = {
     "gateway": "#8acc2e",
@@ -126,6 +129,7 @@ class MeshManagerWindow(QMainWindow):
         self.nodes: dict[str, MeshNode] = {}
         self.links: list[dict[str, str]] = []
         self.paths: list[dict[str, str]] = []
+        self.raw_topology_log = ""
         self._scan_thread: QThread | None = None
         self._scan_worker: ScanWorker | None = None
         self._scan_in_progress = False
@@ -140,7 +144,8 @@ class MeshManagerWindow(QMainWindow):
         self.subnet_input = QLineEdit("192.168.199")
         self.limit_input = QLineEdit("50")
         self.scan_btn = QPushButton("Сканировать")
-        self.auto_refresh = QCheckBox("Авто обновление (2s)")
+        self.save_logs_btn = QPushButton("💾 Сохранить логи (JSON)")
+        self.auto_refresh = QCheckBox("Авто обновление (2с)")
 
         self.topology_mode_combo = QComboBox()
         self.topology_mode_combo.addItems(["Все связи (batctl n)", "Пути до Gateway (batctl tr)"])
@@ -154,6 +159,7 @@ class MeshManagerWindow(QMainWindow):
         controls.addWidget(QLabel("Лимит:"))
         controls.addWidget(self.limit_input)
         controls.addWidget(self.scan_btn)
+        controls.addWidget(self.save_logs_btn)
         controls.addWidget(self.auto_refresh)
         outer.addLayout(controls)
 
@@ -188,6 +194,7 @@ class MeshManagerWindow(QMainWindow):
         splitter.setSizes([380, 820])
 
         self.scan_btn.clicked.connect(self.start_scan)
+        self.save_logs_btn.clicked.connect(self._save_network_logs)
         self.auto_refresh.stateChanged.connect(self._toggle_auto_refresh)
         self.node_list.currentItemChanged.connect(self._show_selected_node)
         self.reboot_btn.clicked.connect(self._reboot_selected_node)
@@ -319,6 +326,7 @@ class MeshManagerWindow(QMainWindow):
     def _refresh_topology(self) -> None:
         self.links = []
         self.paths = []
+        self.raw_topology_log = ""
 
         gateway_ip = None
         for ip, node in self.nodes.items():
@@ -332,6 +340,7 @@ class MeshManagerWindow(QMainWindow):
 
         try:
             topo = get_topology(gateway_ip)
+            self.raw_topology_log = str(topo.get("raw", ""))
 
             if self.topology_mode == "all":
                 self.links = topo.get("links", [])
@@ -350,47 +359,29 @@ class MeshManagerWindow(QMainWindow):
         self._refresh_topology()   # сразу обновляем граф
 
     def _draw_graph(self) -> None:
-
         self.figure.clear()
         ax = self.figure.add_subplot(111)
 
         graph = nx.Graph()
 
-        # === добавляем узлы ===
+        # Добавляем все узлы
         for ip in self.nodes:
             graph.add_node(ip)
 
-        # === готовим рёбра ===
+        # Добавляем рёбра
         edges = []
-        weights = []
-
-        if self.topology_mode == "all":
-            for link in self.links:
-                source = link.get("source")
-                target = link.get("target")
-                tq = link.get("tq", 0)
-
-                if source in self.nodes and target in self.nodes:
-                    edges.append((source, target))
-                    weights.append(tq / 255 if tq else 0.1)
-
-        elif self.topology_mode == "trace":
-            for path in self.paths:
-                # path = ["192.168.199.5", "192.168.199.4", "192.168.199.1"]
-                for i in range(len(path) - 1):
-                    a = path[i]
-                    b = path[i + 1]
-
-                    if a in self.nodes and b in self.nodes:
-                        edges.append((a, b))
-                        weights.append(1.0)  # можно фиксированный вес
+        for link in self.links:
+            source = link.get("source")
+            target = link.get("target")
+            if source in self.nodes and target in self.nodes:
+                edges.append((source, target))
 
         graph.add_edges_from(edges)
 
-        # === цвета узлов ===
+        # === Цвета узлов ===
         colors = []
         for node in graph.nodes:
-            role = str(self.nodes.get(node, MeshNode(node, {})).status.get("role", "client"))
+            role = str(self.nodes.get(node, MeshNode(node, {})).status.get("role", "unknown"))
             colors.append(ROLE_COLORS.get(role, "#95a5a6"))
 
         n = graph.number_of_nodes()
@@ -401,7 +392,7 @@ class MeshManagerWindow(QMainWindow):
             self.canvas.draw_idle()
             return
 
-        # === layout ===
+        # === Выбор layout ===
         if n <= 6:
             pos = nx.circular_layout(graph)
         elif n <= 15:
@@ -409,48 +400,88 @@ class MeshManagerWindow(QMainWindow):
         else:
             pos = nx.spring_layout(graph, seed=42, k=1.8, iterations=120, scale=2.5)
 
-        # === рисуем узлы ===
+        # === Рисуем узлы ===
         nx.draw_networkx_nodes(
-            graph,
-            pos,
+            graph, pos,
             node_color=colors,
-            node_size=7600,
+            node_size=2800,          # уменьшил с 7600 до более разумного размера
             edgecolors="black",
-            linewidths=3,
+            linewidths=2.5,
             ax=ax,
         )
 
-        # === подписи ===
+        # === Подписи узлов ===
         nx.draw_networkx_labels(
-            graph,
-            pos,
+            graph, pos,
             font_size=9,
             font_weight="bold",
             ax=ax
         )
 
-        # === рисуем рёбра (с качеством) ===
+        # === Рисуем рёбра ===
         if edges:
             nx.draw_networkx_edges(
-                graph,
-                pos,
+                graph, pos,
                 edgelist=edges,
-                width=[1 + w * 4 for w in weights],   # толщина зависит от tq
-                edge_color=weights,                  # цвет по tq
-                edge_cmap=plt.cm.RdYlGn,             # красный → зелёный
-                alpha=0.9,
+                edge_color="#2ecc71",      # ← ЗЕЛЁНЫЙ для всех существующих связей
+                width=3.0,
+                alpha=0.95,
                 ax=ax
             )
+        else:
+            # Если связей нет — можно показать красным пунктиром (опционально)
+            pass
 
         ax.set_title(f"Mesh topology — {n} узлов", fontsize=16, pad=20)
         ax.axis("off")
-
-        # === отступы ===
-        margin = 0.25 if n <= 12 else 0.4
-        ax.margins(margin)
+        ax.margins(0.3)
 
         self.figure.tight_layout(pad=2.0)
         self.canvas.draw_idle()
+
+    def _save_network_logs(self) -> None:
+        subnet, limit = self._get_scan_params()
+        default_name = f"mesh-log-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить логи mesh-сети",
+            default_name,
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        # Собираем полные данные узлов
+        nodes_dump = {ip: node.status for ip, node in self.nodes.items()}
+
+        # Определяем source_node (откуда брали топологию)
+        source_node = None
+        for ip, node in self.nodes.items():
+            if node.status.get("role") == "gateway":
+                source_node = ip
+                break
+
+        payload = build_network_log_payload(
+            nodes=nodes_dump,
+            links=self.links,
+            paths=self.paths,
+            topology_mode=self.topology_mode,
+            subnet=subnet,
+            limit=limit,
+            source_node=source_node,
+            raw_batctl_n=getattr(self, 'raw_batctl_n', ''),
+            raw_batctl_tr=getattr(self, 'raw_batctl_tr', ''),
+            scan_duration_ms=getattr(self, 'last_scan_duration_ms', 0),
+            errors=getattr(self, 'last_scan_errors', []),
+        )
+
+        try:
+            saved_path = save_network_logs_json(file_path, payload)
+            QMessageBox.information(self, "✅ Логи сохранены", 
+                                  f"Файл сохранён:\n{saved_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка сохранения", str(exc))
 
     def _selected_ip(self) -> str | None:
         item = self.node_list.currentItem()
