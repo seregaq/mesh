@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
 from api import MeshApiError, get_topology, reboot_node
-from auth import LoginDialog
+from auth import AVAILABLE_PERMISSIONS, LoginDialog, create_account
 from scanner import scan
 from network_logs import build_network_log_payload, save_network_logs_json
 
@@ -121,11 +121,12 @@ class NetworkCreateWorker(QObject):
 
 
 class MeshManagerWindow(QMainWindow):
-    def __init__(self, username: str, role: str) -> None:
+    def __init__(self, username: str, role: str, permissions: list[str] | None = None) -> None:
         super().__init__()
         self.current_username = username
         self.current_role = role
         self.is_admin = self.current_role == "admin"
+        self.current_permissions = set(permissions or [])
         self.setWindowTitle(f"Mesh Manager — {self.current_username} ({self.current_role})")
         self.resize(1200, 720)
 
@@ -207,9 +208,12 @@ class MeshManagerWindow(QMainWindow):
         self.new_network_btn.clicked.connect(self._create_new_network)
         self.orange_ap_btn = QPushButton("🍊 Добавить Orange в роли AP")
         self.orange_ap_btn.clicked.connect(self._add_orange_as_ap)
+        self.create_user_btn = QPushButton("👤 Создать пользователя")
+        self.create_user_btn.clicked.connect(self._create_user)
         left_layout.addWidget(self.orange_ap_btn)
         left_layout.addWidget(self.new_network_btn)
         left_layout.addWidget(self.ssh_add_btn)
+        left_layout.addWidget(self.create_user_btn)
 
         self._progress_reset_timer = QTimer(self)
         self._progress_reset_timer.setSingleShot(True)
@@ -221,18 +225,90 @@ class MeshManagerWindow(QMainWindow):
 
     def _apply_permissions(self) -> None:
         if self.is_admin:
-            return
-        self.reboot_btn.setEnabled(False)
-        self.ssh_add_btn.setEnabled(False)
-        self.new_network_btn.setEnabled(False)
-        self.orange_ap_btn.setEnabled(False)
-        self.setStatusTip("Режим только чтение: изменение конфигурации доступно только admin.")
+            self.current_permissions = set(AVAILABLE_PERMISSIONS)
 
-    def _ensure_admin(self) -> bool:
-        if self.is_admin:
+        self.reboot_btn.setEnabled("reboot_nodes" in self.current_permissions)
+        self.ssh_add_btn.setEnabled("add_nodes_ssh" in self.current_permissions)
+        self.new_network_btn.setEnabled("create_network" in self.current_permissions)
+        self.orange_ap_btn.setEnabled("add_orange_ap" in self.current_permissions)
+        self.create_user_btn.setEnabled("manage_users" in self.current_permissions)
+        if not self.current_permissions:
+            self.setStatusTip("Режим только чтение: изменение конфигурации ограничено.")
+
+    def _ensure_permission(self, permission: str) -> bool:
+        if permission in self.current_permissions:
             return True
         QMessageBox.warning(self, "Недостаточно прав", "Это действие доступно только для admin.")
         return False
+
+    def _create_user(self) -> None:
+        if not self._ensure_permission("manage_users"):
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Создание пользователя")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        username_edit = QLineEdit()
+        password_edit = QLineEdit()
+        password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        role_combo = QComboBox()
+        role_combo.addItems(["viewer", "admin"])
+        form.addRow("Логин:", username_edit)
+        form.addRow("Пароль:", password_edit)
+        form.addRow("Роль:", role_combo)
+        layout.addLayout(form)
+
+        permission_boxes: dict[str, QCheckBox] = {}
+        labels = {
+            "reboot_nodes": "Перезагрузка узлов",
+            "add_nodes_ssh": "Добавление узлов по SSH",
+            "create_network": "Создание новой сети",
+            "add_orange_ap": "Добавление Orange в роли AP",
+            "manage_users": "Управление пользователями",
+        }
+        layout.addWidget(QLabel("Права доступа:"))
+        for perm in AVAILABLE_PERMISSIONS:
+            box = QCheckBox(labels.get(perm, perm))
+            permission_boxes[perm] = box
+            layout.addWidget(box)
+
+        def _sync_permissions_for_role() -> None:
+            is_admin_role = role_combo.currentText() == "admin"
+            for box in permission_boxes.values():
+                box.setChecked(is_admin_role)
+                box.setEnabled(not is_admin_role)
+
+        role_combo.currentTextChanged.connect(_sync_permissions_for_role)
+        _sync_permissions_for_role()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        username = username_edit.text().strip()
+        password = password_edit.text()
+        role = role_combo.currentText()
+        if not username or not password:
+            QMessageBox.warning(self, "Ошибка", "Логин и пароль обязательны.")
+            return
+
+        permissions = [perm for perm, box in permission_boxes.items() if box.isChecked()]
+        try:
+            create_account(username=username, password=password, role=role, permissions=permissions)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Ошибка", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось создать пользователя: {exc}")
+            return
+
+        QMessageBox.information(self, "Готово", f"Пользователь {username} успешно создан.")
 
     def _toggle_auto_refresh(self) -> None:
         if self.auto_refresh.isChecked():
@@ -525,7 +601,7 @@ class MeshManagerWindow(QMainWindow):
         self.details.setText("\n".join(lines))
 
     def _reboot_selected_node(self) -> None:
-        if not self._ensure_admin():
+        if not self._ensure_permission("reboot_nodes"):
             return
         ip = self._selected_ip()
         if not ip:
@@ -541,7 +617,7 @@ class MeshManagerWindow(QMainWindow):
         QMessageBox.information(self, "Done", f"Restart command sent to {ip}")
 
     def _add_node_via_ssh(self) -> None:
-        if not self._ensure_admin():
+        if not self._ensure_permission("add_nodes_ssh"):
             return
         temp_ip = self._selected_ip()
         if not temp_ip:
@@ -941,7 +1017,7 @@ rsn_pairwise=CCMP
             QMessageBox.critical(self, "Ошибка SSH", f"{str(e)}")
 
     def _add_orange_as_ap(self) -> None:
-        if not self._ensure_admin():
+        if not self._ensure_permission("add_orange_ap"):
             return
 
         temp_ip = self._selected_ip()
@@ -1074,7 +1150,7 @@ dhcp-option=6,8.8.8.8,1.1.1.1
             QMessageBox.critical(self, "Ошибка SSH", str(e))
 
     def _create_new_network(self) -> None:
-        if not self._ensure_admin():
+        if not self._ensure_permission("create_network"):
             return
         selected_items = self.node_list.selectedItems()
         if not selected_items:
@@ -1191,6 +1267,7 @@ def run_app() -> None:
     window = MeshManagerWindow(
         username=auth_dialog.account["username"],
         role=auth_dialog.account.get("role", "viewer"),
+        permissions=auth_dialog.account.get("permissions", []),
     )
     window.show()
     window.start_scan()
