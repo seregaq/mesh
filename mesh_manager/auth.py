@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -17,6 +18,13 @@ from PySide6.QtWidgets import (
 
 ACCOUNTS_FILE = Path(__file__).with_name("accounts.json")
 PBKDF2_ITERATIONS = 200_000
+AVAILABLE_PERMISSIONS = (
+    "reboot_nodes",
+    "add_nodes_ssh",
+    "create_network",
+    "add_orange_ap",
+    "manage_users",
+)
 
 
 def hash_password(password: str, salt: str) -> str:
@@ -33,6 +41,28 @@ def load_accounts() -> list[dict[str, str]]:
     with ACCOUNTS_FILE.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     return data.get("accounts", [])
+
+
+def save_accounts(accounts: list[dict[str, str]]) -> None:
+    with ACCOUNTS_FILE.open("w", encoding="utf-8") as handle:
+        json.dump({"accounts": accounts}, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+
+
+def create_account(username: str, password: str, role: str, permissions: list[str]) -> None:
+    accounts = load_accounts()
+    if any(account.get("username") == username for account in accounts):
+        raise ValueError("Пользователь с таким логином уже существует.")
+    salt = base64.b64encode(secrets.token_bytes(16)).decode("utf-8")
+    account = {
+        "username": username,
+        "role": role,
+        "salt": salt,
+        "password_hash": hash_password(password, salt),
+        "permissions": [perm for perm in permissions if perm in AVAILABLE_PERMISSIONS],
+    }
+    accounts.append(account)
+    save_accounts(accounts)
 
 
 def authenticate_user(username: str, password: str) -> dict[str, str] | None:
