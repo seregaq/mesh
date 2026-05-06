@@ -10,6 +10,7 @@ from datetime import datetime
 import networkx as nx
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtCore import Qt
@@ -32,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
-from api import MeshApiError, get_topology, reboot_node
+from api import MeshApiError, get_topology, reboot_node, parse_batctl_o, parse_batctl_tr
 from auth import AVAILABLE_PERMISSIONS, LoginDialog, create_account
 from scanner import scan
 from network_logs import build_network_log_payload, save_network_logs_json
@@ -49,6 +50,8 @@ ROLE_COLORS = {
 class MeshNode:
     ip: str
     status: dict[str, Any]
+    mac: str | None = None
+
 
 
 class ScanWorker(QObject):
@@ -145,6 +148,24 @@ class MeshManagerWindow(QMainWindow):
         outer = QVBoxLayout(root)
         controls = QHBoxLayout()
 
+        button_style = """
+QPushButton {
+    background-color: #e0e0e0;
+    color: #333333;
+    border: 1px solid #b0b0b0;
+    border-radius: 4px;
+    padding: 6px;
+    font-weight: normal;
+}
+QPushButton:hover {
+    background-color: #d0d0d0;
+    border-color: #909090;
+}
+QPushButton:pressed {
+    background-color: #c0c0c0;
+}
+"""
+
         self.subnet_input = QLineEdit("192.168.199")
         self.limit_input = QLineEdit("50")
         self.scan_btn = QPushButton("Сканировать")
@@ -152,7 +173,7 @@ class MeshManagerWindow(QMainWindow):
         self.auto_refresh = QCheckBox("Авто обновление (2с)")
 
         self.topology_mode_combo = QComboBox()
-        self.topology_mode_combo.addItems(["Все связи (batctl n)", "Пути до Gateway (batctl tr)"])
+        self.topology_mode_combo.addItems(["Все связи", "Пути до Gateway"])
         self.topology_mode_combo.setCurrentIndex(0)  # по умолчанию "Все связи"
         self.topology_mode_combo.currentIndexChanged.connect(self._on_topology_mode_changed)
         controls.addWidget(QLabel("Топология:"))
@@ -166,6 +187,8 @@ class MeshManagerWindow(QMainWindow):
         controls.addWidget(self.save_logs_btn)
         controls.addWidget(self.auto_refresh)
         outer.addLayout(controls)
+
+        
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -201,6 +224,7 @@ class MeshManagerWindow(QMainWindow):
         self.save_logs_btn.clicked.connect(self._save_network_logs)
         self.auto_refresh.stateChanged.connect(self._toggle_auto_refresh)
         self.node_list.currentItemChanged.connect(self._show_selected_node)
+        self.node_list.itemSelectionChanged.connect(self._sync_current_item)
         self.reboot_btn.clicked.connect(self._reboot_selected_node)
         self.ssh_add_btn = QPushButton("➕ Добавить в Mesh по SSH")
         self.ssh_add_btn.clicked.connect(self._add_node_via_ssh)
@@ -210,6 +234,13 @@ class MeshManagerWindow(QMainWindow):
         self.orange_ap_btn.clicked.connect(self._add_orange_as_ap)
         self.create_user_btn = QPushButton("👤 Создать пользователя")
         self.create_user_btn.clicked.connect(self._create_user)
+
+        self.orange_ap_btn.setStyleSheet(button_style)
+        self.new_network_btn.setStyleSheet(button_style)
+        self.ssh_add_btn.setStyleSheet(button_style)
+        self.create_user_btn.setStyleSheet(button_style)
+        self.reboot_btn.setStyleSheet(button_style)
+
         left_layout.addWidget(self.orange_ap_btn)
         left_layout.addWidget(self.new_network_btn)
         left_layout.addWidget(self.ssh_add_btn)
@@ -330,25 +361,25 @@ class MeshManagerWindow(QMainWindow):
 
 
             # === DEBUG MODE ===
-        self.nodes = {
-            "192.168.199.1": MeshNode("192.168.199.1", {"role": "gateway"}),
-            "192.168.199.2": MeshNode("192.168.199.2", {"role": "client"}),
-            "192.168.199.3": MeshNode("192.168.199.3", {"role": "client"}),
-            "192.168.199.4": MeshNode("192.168.199.4", {"role": "bridge"}),
-            "192.168.199.5": MeshNode("192.168.199.5", {"role": "ap"}),
-        }
+        # self.nodes = {
+        #     "192.168.199.1": MeshNode("192.168.199.1", {"role": "gateway"}),
+        #     "192.168.199.2": MeshNode("192.168.199.2", {"role": "client"}),
+        #     "192.168.199.3": MeshNode("192.168.199.3", {"role": "client"}),
+        #     "192.168.199.4": MeshNode("192.168.199.4", {"role": "bridge"}),
+        #     "192.168.199.5": MeshNode("192.168.199.5", {"role": "ap"}),
+        # }
 
-        self.links = [
-            {"source": "192.168.199.1", "target": "192.168.199.2", "tq": 255},
-            {"source": "192.168.199.1", "target": "192.168.199.3", "tq": 180},
-            {"source": "192.168.199.2", "target": "192.168.199.4", "tq": 120},
-            {"source": "192.168.199.3", "target": "192.168.199.4", "tq": 200},
-            {"source": "192.168.199.4", "target": "192.168.199.5", "tq": 90},
-        ]
+        # self.links = [
+        #     {"source": "192.168.199.1", "target": "192.168.199.2", "tq": 255},
+        #     {"source": "192.168.199.1", "target": "192.168.199.3", "tq": 180},
+        #     {"source": "192.168.199.2", "target": "192.168.199.4", "tq": 120},
+        #     {"source": "192.168.199.3", "target": "192.168.199.4", "tq": 200},
+        #     {"source": "192.168.199.4", "target": "192.168.199.5", "tq": 90},
+        # ]
 
-        self._refresh_node_list()
-        self._draw_graph()
-        return
+        # self._refresh_node_list()
+        # self._draw_graph()
+        # return
     
     
         if self._scan_in_progress:
@@ -376,7 +407,14 @@ class MeshManagerWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка сканирования", error)
             return
 
-        self.nodes = {node["ip"]: MeshNode(ip=node["ip"], status=node) for node in data if "ip" in node}
+        self.nodes = {
+            node["ip"]: MeshNode(
+                ip=node["ip"],
+                status=node,
+                mac=node.get("mac")
+            )
+            for node in data if "ip" in node
+        }
         self._refresh_node_list()
         self._refresh_topology()
 
@@ -437,11 +475,22 @@ class MeshManagerWindow(QMainWindow):
             topo = get_topology(gateway_ip)
             self.raw_topology_log = str(topo.get("raw", ""))
 
+            raw = topo.get("raw", "")
+
+            
+            mac_to_ip = {
+                node.mac: node.ip
+                for node in self.nodes.values()
+                if node.mac
+            }
+
             if self.topology_mode == "all":
-                self.links = topo.get("links", [])
+                self.links = parse_batctl_o(raw, mac_to_ip)
+                self.paths = []
 
             elif self.topology_mode == "trace":
-                self.paths = topo.get("paths", [])
+                self.paths = parse_batctl_tr(raw, mac_to_ip)
+                self.links = []
 
         except Exception as e:
             print("Topology error:", e)
@@ -465,13 +514,23 @@ class MeshManagerWindow(QMainWindow):
 
         # Добавляем рёбра
         edges = []
-        for link in self.links:
-            source = link.get("source")
-            target = link.get("target")
-            if source in self.nodes and target in self.nodes:
-                edges.append((source, target))
 
-        graph.add_edges_from(edges)
+# режим связей
+        if self.links:
+            for link in self.links:
+                source = link.get("source")
+                target = link.get("target")
+                if source in self.nodes and target in self.nodes:
+                    edges.append((source, target))
+
+        # режим трассировки
+        elif self.paths:
+            for path in self.paths:
+                for i in range(len(path) - 1):
+                    a = path[i]
+                    b = path[i + 1]
+                    if a in self.nodes and b in self.nodes:
+                        edges.append((a, b))
 
         # === Цвета узлов ===
         colors = []
@@ -499,7 +558,7 @@ class MeshManagerWindow(QMainWindow):
         nx.draw_networkx_nodes(
             graph, pos,
             node_color=colors,
-            node_size=2800,          # уменьшил с 7600 до более разумного размера
+            node_size=7600,          
             edgecolors="black",
             linewidths=2.5,
             ax=ax,
@@ -530,6 +589,28 @@ class MeshManagerWindow(QMainWindow):
         ax.set_title(f"Mesh topology — {n} узлов", fontsize=16, pad=20)
         ax.axis("off")
         ax.margins(0.3)
+
+
+        legend_elements = []
+
+        for role, color in ROLE_COLORS.items():
+            legend_elements.append(
+                Line2D(
+                    [0], [0],
+                    marker='o',
+                    color='w',
+                    label=role,
+                    markerfacecolor=color,
+                    markersize=10
+                )
+            )
+
+        ax.legend(
+            handles=legend_elements,
+            loc='lower right',
+            fontsize=9,
+            frameon=True
+        )
 
         self.figure.tight_layout(pad=2.0)
         self.canvas.draw_idle()
@@ -582,23 +663,51 @@ class MeshManagerWindow(QMainWindow):
         item = self.node_list.currentItem()
         return item.data(1) if item else None
 
+    def _sync_current_item(self):
+        items = self.node_list.selectedItems()
+        if items:
+            # всегда делаем текущим последний выбранный
+            self.node_list.setCurrentItem(items[-1])
+
     def _show_selected_node(self) -> None:
-        ip = self._selected_ip()
-        if not ip:
-            self.details.setText("Select a node to see details")
+        items = self.node_list.selectedItems()
+
+        if not items:
+            self.details.setText("Выберите узел")
             return
 
-        node = self.nodes.get(ip)
-        if not node:
-            self.details.setText("Node no longer available")
+        # === один узел ===
+        if len(items) == 1:
+            item = items[0]
+            ip = item.data(1)
+
+            node = self.nodes.get(ip)
+            if not node:
+                return
+
+            data = node.status
+
+            lines = [f"IP: {ip}"]
+            for key in ("role", "load", "uptime", "hostname"):
+                if key in data:
+                    lines.append(f"{key}: {data[key]}")
+
+            self.details.setText("\n".join(lines))
             return
 
-        data = node.status
-        lines = [f"IP: {ip}"]
-        for key in ("role", "load", "uptime", "hostname"):
-            if key in data:
-                lines.append(f"{key}: {data[key]}")
-        self.details.setText("\n".join(lines))
+        # === несколько узлов ===
+        ips = [item.data(1) for item in items if item.data(1) in self.nodes]
+        roles = [self.nodes[ip].status.get("role", "unknown") for ip in ips]
+
+        summary = (
+            f"Выбрано узлов: {len(ips)}\n"
+            f"Gateway: {roles.count('gateway')}\n"
+            f"Client: {roles.count('client')}\n"
+            f"Bridge: {roles.count('bridge')}\n"
+            f"AP: {roles.count('ap')}"
+        )
+
+        self.details.setText(summary)
 
     def _reboot_selected_node(self) -> None:
         if not self._ensure_permission("reboot_nodes"):
@@ -629,26 +738,43 @@ class MeshManagerWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Выбранный узел уже настроен")
             return
 
-        username, ok = QInputDialog.getText(self, "SSH", "Имя пользователя:", text="pi")
-        if not ok or not username:
+        # Единое диалоговое окно для ввода всех данных
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SSH подключение и настройка узла")
+        dialog.resize(400, 300)
+
+        layout = QVBoxLayout(dialog)
+
+        # Поля ввода
+        form_layout = QFormLayout()
+
+        username_edit = QLineEdit("admin")
+        password_edit = QLineEdit("admin")
+        password_edit.setEchoMode(QLineEdit.Password)
+        role_combo = QComboBox()
+        role_combo.addItems(["client", "gateway", "bridge"])
+
+        form_layout.addRow("Имя пользователя:", username_edit)
+        form_layout.addRow("Пароль:", password_edit)
+        form_layout.addRow("Роль узла:", role_combo)
+
+        layout.addLayout(form_layout)
+
+        # Кнопки
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec() != QDialog.Accepted:
             return
 
-        password, ok = QInputDialog.getText(
-            self, "SSH", "Пароль:", text="admin", echo=QLineEdit.EchoMode.Password
-        )
-        if not ok or not password:
-            return
-        
-        role, ok = QInputDialog.getItem(
-            self,
-            "Выбор роли",
-            "Выберите роль узла:",
-            ["client", "gateway", "bridge"],
-            0,
-            False
-        )
+        username = username_edit.text().strip()
+        password = password_edit.text()
+        role = role_combo.currentText()
 
-        if not ok:
+        if not username or not password:
+            QMessageBox.warning(self, "Ошибка", "Логин и пароль обязательны")
             return
     
 
@@ -760,7 +886,7 @@ class MeshManagerWindow(QMainWindow):
 
 # IP: {mesh_ip}
 
-
+sudo systemctl disable NetworkManager
 sudo systemctl stop NetworkManager
 sudo systemctl stop wpa_supplicant
 sudo rfkill unblock wifi
@@ -790,6 +916,7 @@ sudo echo "call-code-mesh" > /etc/mesh/essid
         gateway_mesh_script = f"""
 
 #!/bin/bash
+sudo systemctl stop NetworkManager
 sudo systemctl disable NetworkManager
 sudo systemctl disable wpa_supplicant
 sudo rfkill unblock wifi
@@ -828,6 +955,7 @@ sudo apt-get install -y hostapd bridge-utils
 
 sudo rfkill unblock wifi
 sudo systemctl stop hostapd
+sudo systemctl disable NetworkManager
 sudo systemctl stop NetworkManager
 sudo systemctl stop wpa_supplicant
 

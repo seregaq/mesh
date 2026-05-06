@@ -4,6 +4,67 @@ from typing import Any, Dict
 class MeshApiError(Exception):
     pass
 
+def parse_batctl_o(raw: str, mac_to_ip: dict[str, str]):
+    links = []
+
+    for line in raw.splitlines():
+        line = line.strip()
+
+        # пропускаем мусор
+        if not line or "Originator" in line or "B.A.T.M.A.N" in line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+
+        try:
+            if parts[0] == "*":
+                originator = parts[1]
+                nexthop = parts[4]
+            else:
+                originator = parts[0]
+                nexthop = parts[3]
+        except IndexError:
+            continue
+
+        originator = originator.lower()
+        nexthop = nexthop.lower()
+
+        ip1 = mac_to_ip.get(originator)
+        ip2 = mac_to_ip.get(nexthop)
+
+        # не добавляем self-loop
+        if ip1 and ip2 and ip1 != ip2:
+            links.append({
+                "source": ip1,
+                "target": ip2
+            })
+
+    return links
+
+
+def parse_batctl_tr(raw: str, mac_to_ip: dict[str, str]):
+    paths = []
+
+    for line in raw.splitlines():
+        if "->" not in line:
+            continue
+
+        parts = line.split("->")
+
+        path = []
+        for part in parts:
+            mac = part.strip().split()[0]
+            ip = mac_to_ip.get(mac)
+            if ip:
+                path.append(ip)
+
+        if len(path) >= 2:
+            paths.append(path)
+
+    return paths
+
 
 def get_status(ip: str) -> Dict[str, Any]:
     """Получаем статус — используем твой текущий /status + /info"""
@@ -44,7 +105,8 @@ def get_topology(ip: str, timeout: float = 3.0) -> Dict[str, Any]:
             data = r.json()
             return {
                 "links": data.get("links", []),
-                "raw": data.get("raw_trace", "")
+                "paths": data.get("paths", []),
+                "raw": data.get("raw", "")
             }
         return {"links": []}
     except:
