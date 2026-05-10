@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QInputDialog, QDialog, QFormLayout, QDialogButtonBox)
 
-from api import MeshApiError, get_topology, reboot_node, parse_batctl_o, parse_batctl_tr
+from api import MeshApiError, get_topology, reboot_node, parse_batctl_n, parse_batctl_tr
 from auth import AVAILABLE_PERMISSIONS, LoginDialog, create_account
 from scanner import scan
 from network_logs import build_network_log_payload, save_network_logs_json
@@ -485,7 +485,7 @@ QPushButton:pressed {
             }
 
             if self.topology_mode == "all":
-                self.links = parse_batctl_o(raw, mac_to_ip)
+                self.links = parse_batctl_n(raw, mac_to_ip)
                 self.paths = []
 
             elif self.topology_mode == "trace":
@@ -522,6 +522,7 @@ QPushButton:pressed {
                 target = link.get("target")
                 if source in self.nodes and target in self.nodes:
                     edges.append((source, target))
+                    graph.add_edge(source, target)
 
         # режим трассировки
         elif self.paths:
@@ -531,6 +532,7 @@ QPushButton:pressed {
                     b = path[i + 1]
                     if a in self.nodes and b in self.nodes:
                         edges.append((a, b))
+                        graph.add_edge(source, target)
 
         # === Цвета узлов ===
         colors = []

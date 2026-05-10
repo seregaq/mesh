@@ -25,30 +25,30 @@ def get(name):
     except:
         return "unknown"
 
-def parse_batctl_o(raw):
+def parse_batctl_n(raw):
     entries = []
 
     for line in raw.splitlines():
         line = line.strip()
 
-        if not line or line.startswith("Originator") or line.startswith("["):
+        if (
+            not line
+            or line.startswith("[")
+            or line.startswith("IF")
+        ):
             continue
 
         parts = re.split(r"\s+", line)
 
-        if len(parts) < 5:
+        if len(parts) < 3:
             continue
 
-        originator = parts[0].lower()
-        tq_part = parts[2]  # (255)
-        nexthop = parts[3].lower()
-
-        tq = int(re.findall(r"\d+", tq_part)[0]) if re.findall(r"\d+", tq_part) else 0
+        iface = parts[0]
+        neighbor = parts[1].lower()
 
         entries.append({
-            "originator": originator,
-            "nexthop": nexthop,
-            "tq": tq
+            "iface": iface,
+            "neighbor": neighbor
         })
 
     return entries
@@ -57,7 +57,7 @@ def parse_batctl_o(raw):
 @app.route("/topology")
 def topology():
     try:
-        raw = subprocess.getoutput("sudo batctl o")
+        raw = subprocess.getoutput("sudo batctl n")
         self_mac = subprocess.getoutput("cat /sys/class/net/wlan0/address").strip().lower()
 
         # MAC → IP
@@ -69,25 +69,23 @@ def topology():
             if len(parts) >= 5:
                 mac_to_ip[parts[4].lower()] = parts[0]
 
-        entries = parse_batctl_o(raw)
+        entries = parse_batctl_n(raw)
 
         links = []
 
         for e in entries:
-            nexthop = e["nexthop"]
-            tq = e["tq"]
+            neighbor_mac = e["neighbor"]
 
-            if nexthop in mac_to_ip and self_mac in mac_to_ip:
+            if neighbor_mac in mac_to_ip and self_mac in mac_to_ip:
                 links.append({
                     "source": mac_to_ip[self_mac],
-                    "target": mac_to_ip[nexthop],
-                    "tq": tq
+                    "target": mac_to_ip[neighbor_mac]
                 })
 
-        return jsonify({
-            "links": links,
-            "raw": raw
-        })
+            return jsonify({
+                "links": links,
+                "raw": raw
+            })
 
     except Exception as e:
         return jsonify({
@@ -98,10 +96,14 @@ def topology():
 
 @app.route("/status")
 def status():
+    mac = subprocess.check_output(
+    ["cat", "/sys/class/net/wlan0/address"]
+).decode().strip()
     return jsonify({
         "hostname": socket.gethostname(),
         "ip": get_ip(),
-        "role": "unknown",
+        "role": get("role"),
+        "mac" : mac
     })
 
 @app.route("/neighbors")

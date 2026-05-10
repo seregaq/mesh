@@ -1,44 +1,40 @@
 import requests
 from typing import Any, Dict
-
+import re
 class MeshApiError(Exception):
     pass
 
-def parse_batctl_o(raw: str, mac_to_ip: dict[str, str]):
+def parse_batctl_n(raw: str, mac_to_ip: dict[str, str]):
     links = []
+
+    self_mac_match = re.search(r"MainIF/MAC:\s+\w+/([0-9a-f:]{17})", raw, re.I)
+
+    if not self_mac_match:
+        return links
+
+    self_mac = self_mac_match.group(1).lower()
 
     for line in raw.splitlines():
         line = line.strip()
 
-        # пропускаем мусор
-        if not line or "Originator" in line or "B.A.T.M.A.N" in line:
+        m = re.match(
+            r"^\w+\s+([0-9a-f:]{17})",
+            line,
+            re.I
+        )
+
+        if not m:
             continue
 
-        parts = line.split()
-        if len(parts) < 2:
-            continue
+        neighbor_mac = m.group(1).lower()
 
-        try:
-            if parts[0] == "*":
-                originator = parts[1]
-                nexthop = parts[4]
-            else:
-                originator = parts[0]
-                nexthop = parts[3]
-        except IndexError:
-            continue
+        source_ip = mac_to_ip.get(self_mac)
+        target_ip = mac_to_ip.get(neighbor_mac)
 
-        originator = originator.lower()
-        nexthop = nexthop.lower()
-
-        ip1 = mac_to_ip.get(originator)
-        ip2 = mac_to_ip.get(nexthop)
-
-        # не добавляем self-loop
-        if ip1 and ip2 and ip1 != ip2:
+        if source_ip and target_ip:
             links.append({
-                "source": ip1,
-                "target": ip2
+                "source": source_ip,
+                "target": target_ip
             })
 
     return links
@@ -70,12 +66,13 @@ def get_status(ip: str) -> Dict[str, Any]:
     """Получаем статус — используем твой текущий /status + /info"""
     try:
        
-        r = requests.get(f"http://{ip}:5000/info", timeout=3)
+        #r = requests.get(f"http://{ip}:5000/info", timeout=3)
+        r = requests.get(f"http://{ip}:5000/status", timeout=3)
         if r.status_code == 200:
             data = r.json()
             data.setdefault("ip", ip)
             data.setdefault("role", "client")
-            data.setdefault("configured", True)
+            #data.setdefault("configured", True)
             return data
 
         # Если /info не сработал — пробуем /status
